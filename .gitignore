@@ -44,5 +44,8 @@ claudedocs
 .vitals/
 .worktrees/
 
-# icm 
+# icm
 .fastembed_cache/
+
+# Claude Code local settings (local-only, not shared)
+.claude/settings.local.json
