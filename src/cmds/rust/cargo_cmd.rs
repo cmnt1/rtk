@@ -32,7 +32,9 @@ pub fn run(cmd: CargoCommand, args: &[String], verbose: u8) -> Result<i32> {
 /// Clap strips `--` from parsed args, but cargo subcommands need it to separate
 /// their own flags from test runner flags (e.g. `cargo test -- --nocapture`).
 fn restore_double_dash(args: &[String]) -> Vec<String> {
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<String> = std::env::args_os()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
     restore_double_dash_with_raw(args, &raw_args)
 }
 

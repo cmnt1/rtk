@@ -1052,7 +1052,10 @@ const RTK_META_COMMANDS: &[&str] = &[
 ];
 
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
 
     // No args → show Clap's error (user ran just "rtk" with bad syntax)
     if args.is_empty() {
