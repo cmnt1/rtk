@@ -51,3 +51,6 @@ claudedocs
 
 # Claude Code local settings (local-only, not shared)
 .claude/settings.local.json
+
+# RTK runtime logs (hook audit, local only)
+/logs/
