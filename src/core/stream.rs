@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 
 pub trait StreamFilter {
     fn feed_line(&mut self, line: &str) -> Option<String>;
@@ -91,6 +92,7 @@ pub struct RegexBlockFilter {
 }
 
 impl RegexBlockFilter {
+    #[allow(dead_code)] // future API for command modules; covered by stream filter tests
     pub fn new(tool_name: &str, start_pattern: &str) -> Self {
         Self {
             start_re: Regex::new(start_pattern).unwrap_or_else(|e| {
@@ -175,6 +177,7 @@ impl<F: FnMut(&str) -> Option<String>> StreamFilter for LineFilter<F> {
 
 pub enum FilterMode<'a> {
     Streaming(Box<dyn StreamFilter + 'a>),
+    #[allow(dead_code)] // buffered filters are exercised in tests and kept for filter modules
     Buffered(Box<dyn Fn(&str) -> String + 'a>),
     CaptureOnly,
     Passthrough,
@@ -263,7 +266,7 @@ pub fn run_streaming(
         }
     }
 
-    let live_stderr = matches!(stdout_mode, FilterMode::Streaming(_));
+    let is_streaming = matches!(stdout_mode, FilterMode::Streaming(_));
 
     let mut child = ChildGuard(cmd.spawn().context("Failed to spawn process")?);
 
@@ -296,121 +299,167 @@ pub fn run_streaming(
         StdinMode::Inherit => None,
     };
 
-    let stderr = child.0.stderr.take().context("No child stderr handle")?;
-    let stderr_thread = std::thread::spawn(move || -> String {
-        let mut raw_err = String::new();
-        let mut capped = false;
-        if live_stderr {
-            let stderr_out = io::stderr();
-            let mut err_out = stderr_out.lock();
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                writeln!(err_out, "{}", line).ok();
-                if raw_err.len() + line.len() + 1 <= RAW_CAP {
-                    raw_err.push_str(&line);
-                    raw_err.push('\n');
-                } else if !capped {
-                    capped = true;
-                    eprintln!("[rtk] warning: stderr exceeds 10 MiB — capture truncated");
-                }
-            }
-        } else {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if raw_err.len() + line.len() + 1 <= RAW_CAP {
-                    raw_err.push_str(&line);
-                    raw_err.push('\n');
-                } else if !capped {
-                    capped = true;
-                }
-            }
-        }
-        raw_err
-    });
-
     let stdout = child.0.stdout.take().context("No child stdout handle")?;
+    let stderr = child.0.stderr.take().context("No child stderr handle")?;
     let mut raw_stdout = String::new();
+    let mut raw_stderr = String::new();
     let mut filtered = String::new();
-    let mut capped = false;
+    let mut capped_out = false;
+    let mut capped_err = false;
     let mut saved_filter: Option<Box<dyn StreamFilter + '_>> = None;
+    let mut filter_fd_is_stderr = false;
 
-    {
-        let stdout_handle = io::stdout();
-        let mut out = stdout_handle.lock();
+    if is_streaming {
+        enum StreamLine {
+            Stdout(String),
+            Stderr(String),
+        }
 
-        match stdout_mode {
-            FilterMode::Passthrough => unreachable!("handled by early-return above"),
-            FilterMode::Streaming(mut filter) => {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if capped {
-                        continue;
+        let (tx, rx) = mpsc::channel();
+        let tx_out = tx.clone();
+        let stdout_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx_out.send(StreamLine::Stdout(line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let tx_err = tx;
+        let stderr_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx_err.send(StreamLine::Stderr(line)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        if let FilterMode::Streaming(mut filter) = stdout_mode {
+            let stdout_handle = io::stdout();
+            let mut out = stdout_handle.lock();
+            let stderr_handle = io::stderr();
+            let mut err_out = stderr_handle.lock();
+
+            for msg in rx {
+                let (line, is_stderr) = match msg {
+                    StreamLine::Stderr(l) => (l, true),
+                    StreamLine::Stdout(l) => (l, false),
+                };
+                if is_stderr {
+                    if !capped_err {
+                        if raw_stderr.len() + line.len() < RAW_CAP {
+                            raw_stderr.push_str(&line);
+                            raw_stderr.push('\n');
+                        } else {
+                            capped_err = true;
+                            eprintln!("[rtk] warning: stderr exceeds 10 MiB — capture truncated");
+                        }
                     }
-                    if raw_stdout.len() + line.len() + 1 <= RAW_CAP {
+                } else if !capped_out {
+                    if raw_stdout.len() + line.len() < RAW_CAP {
                         raw_stdout.push_str(&line);
                         raw_stdout.push('\n');
                     } else {
-                        capped = true;
-                        eprintln!("[rtk] warning: output exceeds 10 MiB — filter input truncated");
-                        continue;
+                        capped_out = true;
+                        eprintln!("[rtk] warning: stdout exceeds 10 MiB — filter input truncated");
                     }
-                    if let Some(output) = filter.feed_line(&line) {
-                        filtered.push_str(&output);
-                        match write!(out, "{}", output) {
-                            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
-                            Err(e) => return Err(e.into()),
-                            Ok(_) => {}
+                }
+                filter_fd_is_stderr = is_stderr;
+                if let Some(output) = filter.feed_line(&line) {
+                    filtered.push_str(&output);
+                    let dest: &mut dyn Write = if is_stderr { &mut err_out } else { &mut out };
+                    match write!(dest, "{}", output) {
+                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
+                        Err(e) => return Err(e.into()),
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let tail = filter.flush();
+            filtered.push_str(&tail);
+            let flush_dest: &mut dyn Write = if filter_fd_is_stderr {
+                &mut err_out
+            } else {
+                &mut out
+            };
+            match write!(flush_dest, "{}", tail) {
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+                Err(e) => return Err(e.into()),
+                Ok(_) => {}
+            }
+            saved_filter = Some(filter);
+        }
+
+        stdout_thread.join().ok();
+        stderr_thread.join().ok();
+    } else {
+        let stderr_thread = std::thread::spawn(move || -> String {
+            let mut raw_err = String::new();
+            let mut capped = false;
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if raw_err.len() + line.len() < RAW_CAP {
+                    raw_err.push_str(&line);
+                    raw_err.push('\n');
+                } else if !capped {
+                    capped = true;
+                }
+            }
+            raw_err
+        });
+
+        {
+            let stdout_handle = io::stdout();
+            let mut out = stdout_handle.lock();
+
+            match stdout_mode {
+                FilterMode::Passthrough => unreachable!("handled by early-return above"),
+                FilterMode::Streaming(_) => unreachable!("handled by is_streaming branch"),
+                FilterMode::Buffered(filter_fn) => {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        if raw_stdout.len() + line.len() < RAW_CAP {
+                            raw_stdout.push_str(&line);
+                            raw_stdout.push('\n');
+                        } else if !capped_out {
+                            capped_out = true;
+                            eprintln!(
+                                "[rtk] warning: output exceeds 10 MiB — filter input truncated"
+                            );
                         }
                     }
-                }
-                let tail = filter.flush();
-                filtered.push_str(&tail);
-                match write!(out, "{}", tail) {
-                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-                    Err(e) => return Err(e.into()),
-                    Ok(_) => {}
-                }
-                saved_filter = Some(filter);
-            }
-            FilterMode::Buffered(filter_fn) => {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if raw_stdout.len() + line.len() + 1 <= RAW_CAP {
-                        raw_stdout.push_str(&line);
-                        raw_stdout.push('\n');
-                    } else if !capped {
-                        capped = true;
-                        eprintln!("[rtk] warning: output exceeds 10 MiB — filter input truncated");
+                    filtered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        filter_fn(&raw_stdout)
+                    }))
+                    .unwrap_or_else(|_| {
+                        eprintln!("[rtk] warning: filter panicked — passing through raw output");
+                        raw_stdout.clone()
+                    });
+                    match write!(out, "{}", filtered) {
+                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+                        Err(e) => return Err(e.into()),
+                        Ok(_) => {}
                     }
                 }
-                filtered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    filter_fn(&raw_stdout)
-                }))
-                .unwrap_or_else(|_| {
-                    eprintln!("[rtk] warning: filter panicked — passing through raw output");
-                    raw_stdout.clone()
-                });
-                match write!(out, "{}", filtered) {
-                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-                    Err(e) => return Err(e.into()),
-                    Ok(_) => {}
-                }
-            }
-            FilterMode::CaptureOnly => {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if raw_stdout.len() + line.len() + 1 <= RAW_CAP {
-                        raw_stdout.push_str(&line);
-                        raw_stdout.push('\n');
-                    } else if !capped {
-                        capped = true;
-                        eprintln!("[rtk] warning: output exceeds 10 MiB — filter input truncated");
+                FilterMode::CaptureOnly => {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        if raw_stdout.len() + line.len() < RAW_CAP {
+                            raw_stdout.push_str(&line);
+                            raw_stdout.push('\n');
+                        } else if !capped_out {
+                            capped_out = true;
+                            eprintln!(
+                                "[rtk] warning: output exceeds 10 MiB — filter input truncated"
+                            );
+                        }
                     }
+                    filtered = raw_stdout.clone();
                 }
-                filtered = raw_stdout.clone();
             }
         }
-    }
 
-    let raw_stderr = stderr_thread.join().unwrap_or_else(|e| {
-        eprintln!("[rtk] warning: stderr reader thread panicked: {:?}", e);
-        String::new()
-    });
+        raw_stderr = stderr_thread.join().unwrap_or_else(|e| {
+            eprintln!("[rtk] warning: stderr reader thread panicked: {:?}", e);
+            String::new()
+        });
+    }
     if let Some(t) = stdin_thread {
         t.join().ok();
     }
@@ -422,7 +471,12 @@ pub fn run_streaming(
     if let Some(mut f) = saved_filter {
         if let Some(post) = f.on_exit(exit_code, &raw) {
             filtered.push_str(&post);
-            match write!(io::stdout(), "{}", post) {
+            let mut dest: Box<dyn Write> = if filter_fd_is_stderr {
+                Box::new(io::stderr().lock())
+            } else {
+                Box::new(io::stdout().lock())
+            };
+            match write!(dest, "{}", post) {
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
                 Err(e) => return Err(e.into()),
                 Ok(_) => {}
@@ -470,15 +524,71 @@ pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 
+    #[cfg(windows)]
+    fn shell_command(script: &str) -> Command {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", script]);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    fn shell_command(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn exit_command(code: i32) -> Command {
+        shell_command(&format!("exit /B {}", code))
+    }
+
+    #[cfg(not(windows))]
+    fn exit_command(code: i32) -> Command {
+        shell_command(&format!("exit {}", code))
+    }
+
+    fn stdout_command(text: &str) -> Command {
+        shell_command(&format!("echo {}", text))
+    }
+
+    fn stderr_command(text: &str) -> Command {
+        shell_command(&format!("echo {} 1>&2", text))
+    }
+
+    #[cfg(windows)]
+    fn large_output_command(stream: &str) -> Command {
+        let target = if stream == "stderr" { "Error" } else { "Out" };
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$line = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; for ($i = 0; $i -lt 140000; $i++) {{ [Console]::{}.WriteLine($line) }}",
+                target
+            ),
+        ]);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    fn large_output_command(stream: &str) -> Command {
+        let redirect = if stream == "stderr" { "1>&2" } else { "" };
+        shell_command(&format!(
+            "dd if=/dev/zero bs=1024 count=11264 2>/dev/null | tr '\\0' 'a' | fold -w 80 {}",
+            redirect
+        ))
+    }
+
     #[test]
     fn test_exit_code_zero() {
-        let status = Command::new("true").status().unwrap();
+        let status = exit_command(0).status().unwrap();
         assert_eq!(status_to_exit_code(status), 0);
     }
 
     #[test]
     fn test_exit_code_nonzero() {
-        let status = Command::new("false").status().unwrap();
+        let status = exit_command(1).status().unwrap();
         assert_eq!(status_to_exit_code(status), 1);
     }
 
@@ -554,8 +664,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_passthrough_echo() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("hello");
+        let mut cmd = stdout_command("hello");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 0);
         // Passthrough inherits TTY — raw/filtered are empty
@@ -564,15 +673,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_exit_code_preserved() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "exit 42"]);
+        let mut cmd = exit_command(42);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 42);
     }
 
     #[test]
     fn test_run_streaming_exit_code_zero() {
-        let mut cmd = Command::new("true");
+        let mut cmd = exit_command(0);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result.success());
@@ -580,7 +688,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_exit_code_one() {
-        let mut cmd = Command::new("false");
+        let mut cmd = exit_command(1);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 1);
         assert!(!result.success());
@@ -628,12 +736,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_raw_cap_at_10mb() {
-        let mut cmd = Command::new("sh");
-        // ~11 MiB of 80-char lines (fast: fewer lines than `yes | head -6M`)
-        cmd.args([
-            "-c",
-            "dd if=/dev/zero bs=1024 count=11264 2>/dev/null | tr '\\0' 'a' | fold -w 80",
-        ]);
+        let mut cmd = large_output_command("stdout");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         assert!(
             result.raw.len() <= 10_485_760 + 100,
@@ -648,12 +751,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_stderr_cap_at_10mb() {
-        let mut cmd = Command::new("sh");
-        // ~11 MiB on stderr, nothing on stdout
-        cmd.args([
-            "-c",
-            "dd if=/dev/zero bs=1024 count=11264 2>/dev/null | tr '\\0' 'a' | fold -w 80 1>&2",
-        ]);
+        let mut cmd = large_output_command("stderr");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         // raw = raw_stdout + raw_stderr; stdout is empty so raw ≈ stderr size
         assert!(
@@ -665,7 +763,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_child_guard_prevents_zombie() {
-        let mut cmd = Command::new("true");
+        let mut cmd = exit_command(0);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().exit_code, 0);
@@ -673,31 +771,28 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_null_stdin_cat() {
-        let mut cmd = Command::new("cat");
+        let mut cmd = shell_command(if cfg!(windows) { "more" } else { "cat" });
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 0);
     }
 
     #[test]
     fn test_run_streaming_raw_contains_stdout() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("test_output_xyz");
+        let mut cmd = stdout_command("test_output_xyz");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         assert!(result.raw.contains("test_output_xyz"));
     }
 
     #[test]
     fn test_run_streaming_capture_only_filtered_equals_raw() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("check_equality");
+        let mut cmd = stdout_command("check_equality");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         assert_eq!(result.filtered.trim(), result.raw_stdout.trim());
     }
 
     #[test]
     fn test_exec_capture_success() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("hello_capture");
+        let mut cmd = stdout_command("hello_capture");
         let result = exec_capture(&mut cmd).unwrap();
         assert!(result.success());
         assert_eq!(result.exit_code, 0);
@@ -706,7 +801,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_exec_capture_failure() {
-        let mut cmd = Command::new("false");
+        let mut cmd = exit_command(1);
         let result = exec_capture(&mut cmd).unwrap();
         assert!(!result.success());
         assert_eq!(result.exit_code, 1);
@@ -714,16 +809,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_exec_capture_stderr() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo err_msg >&2"]);
+        let mut cmd = stderr_command("err_msg");
         let result = exec_capture(&mut cmd).unwrap();
         assert!(result.stderr.contains("err_msg"));
     }
 
     #[test]
     fn test_exec_capture_combined() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo out_msg; echo err_msg >&2"]);
+        let mut cmd = shell_command("echo out_msg && echo err_msg 1>&2");
         let result = exec_capture(&mut cmd).unwrap();
         let combined = result.combined();
         assert!(combined.contains("out_msg"));
@@ -862,6 +955,65 @@ pub(crate) mod tests {
             result.contains("error: fatal\n  details"),
             "got: {}",
             result
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_streaming_filters_both_fds_and_routes_to_correct_fd() {
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 'error[E0308]: type mismatch'; echo '   Compiling foo v1.0' >&2; echo '   Downloading bar v2.0' >&2; echo '   Finished dev' >&2; echo 'real error on stderr' >&2"]);
+
+        struct CargoLikeHandler;
+        impl BlockHandler for CargoLikeHandler {
+            fn should_skip(&mut self, line: &str) -> bool {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("Compiling")
+                    || trimmed.starts_with("Downloading")
+                    || trimmed.starts_with("Finished")
+            }
+            fn is_block_start(&mut self, line: &str) -> bool {
+                line.starts_with("error")
+            }
+            fn is_block_continuation(&mut self, line: &str, _block: &[String]) -> bool {
+                line.starts_with(' ')
+            }
+            fn format_summary(&self, _: i32, _: &str) -> Option<String> {
+                None
+            }
+        }
+
+        let filter = BlockStreamFilter::new(CargoLikeHandler);
+        let result = run_streaming(
+            &mut cmd,
+            StdinMode::Null,
+            FilterMode::Streaming(Box::new(filter)),
+        )
+        .unwrap();
+
+        assert!(
+            result.filtered.contains("error[E0308]"),
+            "filtered should contain stdout errors, got: {}",
+            result.filtered
+        );
+        assert!(
+            !result.filtered.contains("Compiling"),
+            "cargo noise should be filtered out, got: {}",
+            result.filtered
+        );
+        assert!(
+            !result.filtered.contains("Downloading"),
+            "cargo noise should be filtered out, got: {}",
+            result.filtered
+        );
+        assert!(
+            result.raw_stderr.contains("Compiling"),
+            "raw_stderr should capture all stderr lines"
+        );
+        assert!(
+            result.raw_stderr.contains("real error on stderr"),
+            "raw_stderr should capture all stderr lines"
         );
     }
 }
