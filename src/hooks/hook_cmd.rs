@@ -261,8 +261,14 @@ fn sanitize_log_field(s: &str) -> String {
 }
 
 fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> {
-    let home = dirs::home_dir()?;
-    let dir = home.join(".local").join("share").join("rtk");
+    // Honor RTK_AUDIT_DIR to match the reader (hook_audit_cmd::default_log_path).
+    // Without this override, writer hard-coded ~/.local/share/rtk/ would silently
+    // drift from a user-configured audit directory.
+    let dir = if let Ok(d) = std::env::var("RTK_AUDIT_DIR") {
+        std::path::PathBuf::from(d)
+    } else {
+        dirs::home_dir()?.join(".local").join("share").join("rtk")
+    };
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("hook-audit.log");
     let mut file = std::fs::OpenOptions::new()

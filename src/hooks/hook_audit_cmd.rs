@@ -4,15 +4,15 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Default log file location (aligned with hook's $HOME/.local/share/rtk/).
+/// Default log file location (aligned with hook's writer side).
+/// Uses `dirs::home_dir()` instead of `$HOME` so the fallback works on Windows
+/// (which does not set $HOME by default) and matches the writer's home lookup.
 fn default_log_path() -> PathBuf {
     if let Ok(dir) = std::env::var("RTK_AUDIT_DIR") {
         PathBuf::from(dir).join("hook-audit.log")
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home)
-            .join(".local/share/rtk")
-            .join("hook-audit.log")
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".local/share/rtk").join("hook-audit.log")
     }
 }
 
