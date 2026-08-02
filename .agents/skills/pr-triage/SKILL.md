@@ -224,7 +224,7 @@ prompt: |
 
   Apply your security-guardian and backend-architect skills for this review.
   Additionally, apply the RTK-specific checklist:
-  - lazy_static! regex (no inline Regex::new())
+  - LazyLock<Regex> for fixed reused patterns (no inline Regex::new() in hot paths)
   - anyhow::Result + .context() (no unwrap())
   - Fallback to raw command on filter failure
   - Exit code propagation
