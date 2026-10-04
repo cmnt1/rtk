@@ -1,17 +1,17 @@
 //! Audits hook activity logs to show what commands were rewritten and when.
 
+use crate::core::{user_dirs, user_env};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Default log file location (aligned with hook's writer side).
-/// Uses `dirs::home_dir()` instead of `$HOME` so the fallback works on Windows
-/// (which does not set $HOME by default) and matches the writer's home lookup.
+/// Uses the same home lookup as the writer, including on Windows and in tests.
 fn default_log_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("RTK_AUDIT_DIR") {
+    if let Some(dir) = user_env::var("RTK_AUDIT_DIR") {
         PathBuf::from(dir).join("hook-audit.log")
     } else {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let home = user_dirs::home().unwrap_or_else(|| PathBuf::from("/tmp"));
         home.join(".local/share/rtk").join("hook-audit.log")
     }
 }
@@ -181,6 +181,27 @@ pub fn run(since_days: u64, verbose: u8) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_log_path_uses_isolated_home() {
+        let root = crate::core::test_isolation::tempdir();
+        crate::core::test_isolation::with_root(root.path(), || {
+            user_env::with_vars(&[("RTK_AUDIT_DIR", None)], || {
+                assert_eq!(
+                    default_log_path(),
+                    root.path().join(".local/share/rtk/hook-audit.log")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn test_default_log_path_honors_audit_dir() {
+        let dir = crate::core::test_isolation::tempdir();
+        user_env::with_path("RTK_AUDIT_DIR", Some(dir.path()), || {
+            assert_eq!(default_log_path(), dir.path().join("hook-audit.log"));
+        });
+    }
 
     #[test]
     fn test_parse_line_rewrite() {
